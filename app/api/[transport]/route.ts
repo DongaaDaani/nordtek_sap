@@ -512,4 +512,4 @@ const handler = createMcpHandler(
   }
 );
 
-export { handler as GET, handler as POST, handler as DELE
+export { handler as GET, handler as POST, handler as DELETE };
