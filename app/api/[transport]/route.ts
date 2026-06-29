@@ -18,7 +18,7 @@ function ok(data: unknown) {
 
 // ─── MCP handler ──────────────────────────────────────────────────────────────
 const handler = createMcpHandler(
-  (server) => {
+  async (server) => {
 
     // ── SYSTEM ──────────────────────────────────────────────────────────────
     server.tool(
@@ -512,4 +512,4 @@ const handler = createMcpHandler(
   }
 );
 
-export { handler as GET, handler as POST, handler as DELETE };
+export { handler as GET, handler as POST, handler as DELE
