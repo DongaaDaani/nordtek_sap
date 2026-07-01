@@ -15,6 +15,17 @@ function ok(data: unknown) {
   return { content: [{ type: "text" as const, text: JSON.stringify(data, null, 2) }] };
 }
 
+/** Build a query string from an object, skipping undefined/null values */
+function buildQuery(params: Record<string, string | number | boolean | undefined | null>): string {
+  const parts: string[] = [];
+  for (const [key, val] of Object.entries(params)) {
+    if (val !== undefined && val !== null && val !== "") {
+      parts.push(`${encodeURIComponent(key)}=${encodeURIComponent(String(val))}`);
+    }
+  }
+  return parts.length ? "?" + parts.join("&") : "";
+}
+
 // ─── MCP handler ──────────────────────────────────────────────────────────────
 const handler = createMcpHandler(
   async (server) => {
@@ -467,20 +478,23 @@ const handler = createMcpHandler(
         ok(await sapDelete(`/document/delete-line/${doc_type}/${doc_entry}/${line_num}`))
     );
 
-    // ── INVOICES / DELIVERIES ────────────────────────────────────────────────
+    // ── INVOICES / DELIVERIES (számlázási integráció) ────────────────────────
     server.tool(
       "sap_get_invoice_deliveries",
-      "Szállítólevelek DocNum listájának lekérése a megadott dátum után. Árbevétel-összesítőhöz használd a sap_revenue_summary tool-t.",
+      "Szállítólevelek listája számlázási/integrációs célra, dátumtartomány alapján szűrhető. Visszaad: docnum, docentry, DocCur, konyvelesi_datum, total, vat_total, SellerCompany.",
       {
-        from: z.string().describe("Kezdő dátum pl. 2026-01-01 (Carbon::parse értelmezi)"),
+        from: z.string().optional().describe("Kezdő dátum pl. 2026-01-01"),
+        to: z.string().optional().describe("Záró dátum pl. 2026-06-30"),
       },
-      async ({ from }) =>
-        ok(await sapGet(`/invoice/deliveries?from=${encodeURIComponent(from)}`))
+      async ({ from, to }) => {
+        const q = buildQuery({ from, to });
+        return ok(await sapGet(`/invoice/deliveries${q}`));
+      }
     );
 
     server.tool(
       "sap_get_invoice_delivery",
-      "Szállítólevél adatai számlázáshoz/integrációhoz (konyvelesi_datum, OsszesenFC, tételek).",
+      "Szállítólevél részletes adatai számlázáshoz/integrációhoz (konyvelesi_datum, OsszesenFC, tételek).",
       { doc_num: z.number().describe("Szállítólevél DocNum") },
       async ({ doc_num }) => ok(await sapGet(`/invoice/delivery/${doc_num}`))
     );
@@ -496,41 +510,96 @@ const handler = createMcpHandler(
         ok(await sapPost(`/invoice/delivery/${doc_num}`, { invoiceNumber: invoice_number }))
     );
 
-    // ── WEBSHOP ──────────────────────────────────────────────────────────────
+    // ── WEBSHOP — DOKUMENTUM LISTÁK ─────────────────────────────────────────
     server.tool(
       "sap_get_webshop_orders",
-      "Webshop rendelések lapozott listája (doc_entry szerint csökkenő = legújabb első). Tartalmaz vevő adatot, szállítási/fizetési módot, tételeket árakkal és készlettel. Rendelés-elemzéshez, státusz lekérdezéshez.",
+      "Webshop rendelések lapozott listája szűrési lehetőségekkel. id szerint csökkenő sorrend (legújabb első). Tartalmaz vevőadatot, szállítási/fizetési módot, tételeket árakkal és készlettel.",
       {
-        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1, ~15 rekord/oldal)"),
+        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1)"),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD (webshop created_at mezőre)"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD"),
+        card_code: z.string().optional().describe("Partner CardCode szűrő, pl. C100001"),
+        payment_status: z.string().optional().describe("Fizetési státusz szűrő"),
+        weborder_status: z.string().optional().describe("Webshop rendelés státusz szűrő, pl. new, processing"),
+        seller_company_code: z.string().optional().describe("Eladó cég kódja, pl. NORD"),
       },
-      async ({ page = 1 }) => ok(await sapGet(`/webshop/orders?page=${page}`))
+      async ({ page = 1, per_page, from, to, card_code, payment_status, weborder_status, seller_company_code }) => {
+        const q = buildQuery({ page, per_page, from, to, cardCode: card_code, payment_status, weborder_status, seller_company_code });
+        return ok(await sapGet(`/webshop/orders${q}`));
+      }
     );
 
     server.tool(
       "sap_get_webshop_inquiries",
-      "Webshop ajánlatkérések lapozott listája (id szerint csökkenő = legújabb első).",
+      "Webshop ajánlatkérések lapozott listája szűrési lehetőségekkel. id szerint csökkenő sorrend.",
       {
         page: z.number().optional().default(1),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD (webshop created_at mezőre)"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD"),
+        card_code: z.string().optional().describe("Partner CardCode szűrő"),
+        status: z.string().optional().describe("Ajánlat státusz szűrő"),
+        seller_company_code: z.string().optional(),
       },
-      async ({ page = 1 }) => ok(await sapGet(`/webshop/inquiries?page=${page}`))
+      async ({ page = 1, per_page, from, to, card_code, status, seller_company_code }) => {
+        const q = buildQuery({ page, per_page, from, to, cardCode: card_code, status, seller_company_code });
+        return ok(await sapGet(`/webshop/inquiries${q}`));
+      }
     );
 
     server.tool(
       "sap_get_webshop_invoices",
-      "SAP számla lista lapozva (doc_entry szerint csökkenő = legújabb első). Mezők: doc_entry, document_date, card_code, total, vat_total, discount_total, sap_currency_code, payment_status, courier, tracking_number, invoice_path stb. Időszak szerinti szűréshez iteráld az oldalakat — a sap_revenue_summary ezt automatikusan végzi.",
+      "SAP szamlák lapozott listája szűrési lehetőségekkel. doc_entry szerint csökkenő (legújabb első). Mezők: doc_entry, document_date, card_code, total, vat_total, sap_currency_code, payment_status, courier, tracking_number stb. Gyors árbevétel-elemzéshez használd a sap_revenue_summary tool-t.",
       {
-        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1, ~15 rekord/oldal)"),
+        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1)"),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD (document_date mezőre)"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD"),
+        card_code: z.string().optional().describe("Partner CardCode szűrő"),
+        payment_status: z.string().optional().describe("Fizetési státusz: paid, open stb."),
+        weborder_status: z.string().optional().describe("Webshop rendelési státusz szűrő"),
+        seller_company_code: z.string().optional().describe("Eladó cég kódja"),
       },
-      async ({ page = 1 }) => ok(await sapGet(`/webshop/invoices?page=${page}`))
+      async ({ page = 1, per_page, from, to, card_code, payment_status, weborder_status, seller_company_code }) => {
+        const q = buildQuery({ page, per_page, from, to, cardCode: card_code, payment_status, weborder_status, seller_company_code });
+        return ok(await sapGet(`/webshop/invoices${q}`));
+      }
+    );
+
+    server.tool(
+      "sap_get_webshop_deliveries",
+      "SAP szállítólevelek lapozott listája szűrési lehetőségekkel. doc_entry szerint csökkenő. Mezők: doc_entry, document_date, booking_date, card_code, total, vat_total, sap_currency_code, payment_status, tracking_number stb.",
+      {
+        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1)"),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD (booking_date mezőre)"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD"),
+        card_code: z.string().optional().describe("Partner CardCode szűrő"),
+        payment_status: z.string().optional().describe("Fizetési státusz szűrő"),
+        seller_company_code: z.string().optional().describe("Eladó cég kódja"),
+      },
+      async ({ page = 1, per_page, from, to, card_code, payment_status, seller_company_code }) => {
+        const q = buildQuery({ page, per_page, from, to, cardCode: card_code, payment_status, seller_company_code });
+        return ok(await sapGet(`/webshop/deliveries${q}`));
+      }
     );
 
     server.tool(
       "sap_get_webshop_products",
-      "Webshop termékek lapozott listája (item_code szerint növekvő). Tartalmaz HUF/EUR árszinteket és készlet adatokat. Árlistához, készlet-áttekintéshez. Egy adott cikkhez használd a sap_find_product_stock tool-t.",
+      "Webshop termékek lapozott listája szűrési lehetőségekkel (item_code szerint növekvő). Tartalmaz HUF/EUR árszinteket, készletadatokat (main_stock, outer_stock, total_stock, available_stock). Szűrhető cikkcsoportra, aktív státuszra, webshop-elérhetőségre, készletállapotra.",
       {
-        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1, ~15 termék/oldal)"),
+        page: z.number().optional().default(1).describe("Oldalszám (alapért. 1)"),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        sap_item_group_id: z.number().optional().describe("SAP cikkcsoport azonosító szűrő"),
+        is_active: z.boolean().optional().describe("Csak aktív (true) vagy inaktív (false) cikkek"),
+        sellable_in_webshop: z.boolean().optional().describe("Webshopban értékesíthető szűrő"),
+        stock_status: z.enum(["in_stock", "out_of_stock"]).optional().describe("Készletállapot szűrő"),
       },
-      async ({ page = 1 }) => ok(await sapGet(`/webshop/products?page=${page}`))
+      async ({ page = 1, per_page, sap_item_group_id, is_active, sellable_in_webshop, stock_status }) => {
+        const q = buildQuery({ page, per_page, sap_item_group_id, is_active, sellable_in_webshop, stock_status });
+        return ok(await sapGet(`/webshop/products${q}`));
+      }
     );
 
     server.tool(
@@ -538,147 +607,120 @@ const handler = createMcpHandler(
       "Webshop vevők lapozott listája számlázási/szállítási adatokkal, SAP business partner és kontakt hivatkozásokkal.",
       {
         page: z.number().optional().default(1),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
       },
-      async ({ page = 1 }) => ok(await sapGet(`/webshop/customers?page=${page}`))
+      async ({ page = 1, per_page }) => {
+        const q = buildQuery({ page, per_page });
+        return ok(await sapGet(`/webshop/customers${q}`));
+      }
     );
 
-    // ── ANALYTICS — szerver-oldali aggregáció ────────────────────────────────
+    server.tool(
+      "sap_list_webshop_business_partners",
+      "Business partnerek lapozott listája a webshop rendszerből, kapcsolattartókkal és címekkel együtt. Szűrhető: aktív státusz, ország, partnercsoport, értékesítő. Pl.: 'HU aktív partnerek', 'egy értékesítő összes vevője', 'partnercsoport tagok'.",
+      {
+        page: z.number().optional().default(1),
+        per_page: z.number().optional().describe("Rekord/oldal (max 100, alapért. 15)"),
+        is_active: z.enum(["Y", "N"]).optional().describe("Aktív: Y, Inaktív: N"),
+        country: z.string().optional().describe("Ország kód, pl. HU, DE, FR"),
+        sap_card_group_id: z.number().optional().describe("SAP partnercsoport azonosító"),
+        sales_person_id: z.number().optional().describe("Értékesítő azonosítója"),
+      },
+      async ({ page = 1, per_page, is_active, country, sap_card_group_id, sales_person_id }) => {
+        const q = buildQuery({ page, per_page, is_active, country, sap_card_group_id, sales_person_id });
+        return ok(await sapGet(`/webshop/business-partners${q}`));
+      }
+    );
+
+    // ── ANALYTICS ────────────────────────────────────────────────────────────
+
     server.tool(
       "sap_revenue_summary",
-      "Árbevétel összesítő adott időszakra: iterálja a webshop számlákat és pénznemenként összesíti a bruttó/nettó/ÁFA összegeket. Visszaad számlaszámot, top partnereket és fizetési státusz bontást is. Pl.: 'április árbevétel', 'Q1 forgalom', 'múlt havi számlák összege', 'éves bevétel pénznemenként'.",
+      "Árbevétel analytics adott időszakra — egyetlen gyors API hívás. Visszaad: számla darabszám, devizánkénti bruttó/nettó/ÁFA összesítő, fizetési státusz szerinti bontás, top vevők. Pl.: 'április árbevétel', 'Q1 forgalom EUR-ban', 'múlt hónap számlák összege', 'éves bevétel devizánként', 'kik a top vevők'.",
       {
-        from: z.string().describe("Kezdő dátum YYYY-MM-DD, pl. 2026-04-01"),
-        to: z.string().describe("Záró dátum YYYY-MM-DD, pl. 2026-04-30"),
-        max_pages: z.number().optional().default(200).describe("Max iterált oldalszám (alapért. 200)"),
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD, pl. 2026-04-01"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD, pl. 2026-04-30"),
+        currency: z.string().optional().describe("Pénznem szűrő, pl. EUR vagy HUF"),
+        payment_status: z.string().optional().describe("Fizetési státusz szűrő, pl. paid, open"),
+        seller_company_code: z.string().optional().describe("Eladó cég kódja, pl. NORD"),
+        top_limit: z.number().optional().default(10).describe("Top vevők száma (max 100, alapért. 10)"),
       },
-      async ({ from, to, max_pages = 200 }) => {
-        const fromDate = new Date(`${from}T00:00:00`);
-        const toDate = new Date(`${to}T23:59:59`);
+      async ({ from, to, currency, payment_status, seller_company_code, top_limit = 10 }) => {
+        const q = buildQuery({ from, to, currency, payment_status, seller_company_code, top_limit });
+        return ok(await sapGet(`/webshop/analytics/revenue${q}`));
+      }
+    );
 
-        // Aggregation buckets
-        const grossByCur: Record<string, number> = {};
-        const netByCur: Record<string, number> = {};
-        const vatByCur: Record<string, number> = {};
-        const discountByCur: Record<string, number> = {};
-        const invoicesByCard: Record<string, number> = {};
-        const byPaymentStatus: Record<string, number> = {};
-        let invoiceCount = 0;
-        let stoppedEarly = false;
+    server.tool(
+      "sap_analytics_inventory",
+      "Készlet összesítő raktárak vagy cikkcsoportok szerint. Minden raktárhoz/csoporthoz visszaadja: cikkszám, mennyiség (on_hand, committed, on_order), becsült készletérték HUF-ban. Pl.: 'melyik raktárban mennyi van', 'teljes készletérték', 'cikkcsoport készlet', 'raktárak összehasonlítása'.",
+      {
+        group_by: z.enum(["warehouse", "item_group"]).optional().default("warehouse").describe("Csoportosítás: warehouse (alapért.) vagy item_group"),
+        sap_item_group_id: z.number().optional().describe("SAP cikkcsoport azonosító szűrő"),
+        warehouse_code: z.string().optional().describe("Raktár kód szűrő, pl. 01"),
+        is_active: z.boolean().optional().describe("Csak aktív cikkek szűrő"),
+        sellable_in_webshop: z.boolean().optional().describe("Webshopban értékesíthető cikkek szűrő"),
+      },
+      async ({ group_by = "warehouse", sap_item_group_id, warehouse_code, is_active, sellable_in_webshop }) => {
+        const q = buildQuery({ group_by, sap_item_group_id, warehouse_code, is_active, sellable_in_webshop });
+        return ok(await sapGet(`/webshop/analytics/inventory${q}`));
+      }
+    );
 
-        for (let page = 1; page <= max_pages && !stoppedEarly; page++) {
-          let result: { data?: any[]; meta?: any } | null = null;
-          try {
-            result = await sapGet<{ data?: any[]; meta?: any }>(`/webshop/invoices?page=${page}`);
-          } catch {
-            break;
-          }
+    server.tool(
+      "sap_analytics_slow_moving",
+      "Lassan mozgó vagy túlkészletezett cikkek listája — azon termékek, amelyekből sokat tartunk, de keveset adunk el. Alapértelmezés: az elmúlt 90 napban 0 eladott mennyiség, de van készleten. Hasznos: 'mi áll a raktárban', 'túlkészlet azonosítás', 'dead stock', 'milyen cikkeket nem adunk el'.",
+      {
+        from: z.string().optional().describe("Eladási időszak kezdete YYYY-MM-DD (alapért. ma-90 nap)"),
+        to: z.string().optional().describe("Eladási időszak vége YYYY-MM-DD"),
+        max_sold_quantity: z.number().optional().default(0).describe("Maximum eladott mennyiség az időszakban (alapért. 0)"),
+        min_stock_quantity: z.number().optional().default(1).describe("Minimum jelenlegi készlet (alapért. 1)"),
+        sap_item_group_id: z.number().optional().describe("SAP cikkcsoport szűrő"),
+        warehouse_code: z.string().optional().describe("Raktár kód szűrő"),
+        top_limit: z.number().optional().default(50).describe("Visszaadott cikkek száma (max 100, alapért. 50)"),
+      },
+      async ({ from, to, max_sold_quantity, min_stock_quantity, sap_item_group_id, warehouse_code, top_limit }) => {
+        const q = buildQuery({ from, to, max_sold_quantity, min_stock_quantity, sap_item_group_id, warehouse_code, top_limit });
+        return ok(await sapGet(`/webshop/analytics/inventory/slow-moving${q}`));
+      }
+    );
 
-          const invoices = result?.data ?? [];
-          if (invoices.length === 0) break;
-
-          for (const inv of invoices) {
-            const rawDate = inv.document_date ?? inv.booking_date ?? null;
-            if (!rawDate) continue;
-
-            const docDate = new Date(`${rawDate}T00:00:00`);
-
-            // Invoices are ordered by doc_entry desc (newest first).
-            // Once we see a date before our from boundary, we can stop.
-            if (docDate < fromDate) {
-              stoppedEarly = true;
-              break;
-            }
-
-            // Skip invoices newer than to boundary
-            if (docDate > toDate) continue;
-
-            // Within range — aggregate
-            const cur = (inv.sap_currency_code ?? "UNKNOWN") as string;
-            const gross = parseFloat(String(inv.total ?? "0")) || 0;
-            const vat = parseFloat(String(inv.vat_total ?? "0")) || 0;
-            const discount = parseFloat(String(inv.discount_total ?? "0")) || 0;
-            const net = gross - vat;
-
-            grossByCur[cur] = (grossByCur[cur] ?? 0) + gross;
-            vatByCur[cur] = (vatByCur[cur] ?? 0) + vat;
-            netByCur[cur] = (netByCur[cur] ?? 0) + net;
-            discountByCur[cur] = (discountByCur[cur] ?? 0) + discount;
-
-            const cardCode = inv.card_code ?? "unknown";
-            invoicesByCard[cardCode] = (invoicesByCard[cardCode] ?? 0) + 1;
-
-            const pStatus = inv.payment_status ?? "unknown";
-            byPaymentStatus[pStatus] = (byPaymentStatus[pStatus] ?? 0) + 1;
-
-            invoiceCount++;
-          }
-        }
-
-        const revenueByCurrency = Object.entries(grossByCur).map(([currency, gross]) => ({
-          currency,
-          gross_total: Math.round(gross * 100) / 100,
-          net_total: Math.round((netByCur[currency] ?? 0) * 100) / 100,
-          vat_total: Math.round((vatByCur[currency] ?? 0) * 100) / 100,
-          discount_total: Math.round((discountByCur[currency] ?? 0) * 100) / 100,
-        }));
-
-        const topCustomers = Object.entries(invoicesByCard)
-          .sort(([, a], [, b]) => b - a)
-          .slice(0, 15)
-          .map(([card_code, count]) => ({ card_code, invoice_count: count }));
-
-        return ok({
-          period: { from, to },
-          invoice_count: invoiceCount,
-          revenue_by_currency: revenueByCurrency,
-          payment_status_breakdown: byPaymentStatus,
-          top_customers_by_invoice_count: topCustomers,
-          note: stoppedEarly
-            ? `Az időszak elejét elérve leállt. Összesen ${invoiceCount} számla feldolgozva.`
-            : `Max ${max_pages} oldal feldolgozva, ${invoiceCount} számla összesítve.`,
-        });
+    server.tool(
+      "sap_analytics_top_selling",
+      "Legtöbbet eladott termékek listája eladott mennyiség alapján, SAP számlák és/vagy szállítólevelek alapján. Pl.: 'top 10 termék', 'legjobban fogyó cikkek ebben a hónapban', 'Q1 bestseller lista', 'melyik cikket adtuk el legtöbbet', 'egy konkrét cikk forgalma'.",
+      {
+        from: z.string().optional().describe("Kezdő dátum YYYY-MM-DD (document_date mezőre)"),
+        to: z.string().optional().describe("Záró dátum YYYY-MM-DD"),
+        document_type: z.enum(["invoice", "delivery"]).optional().describe("Dokumentum típus szűrő (alapért. mindkettő)"),
+        item_code: z.string().optional().describe("Egy konkrét cikkszám forgalmának lekérdezése"),
+        sap_item_group_id: z.number().optional().describe("SAP cikkcsoport szűrő"),
+        top_limit: z.number().optional().default(10).describe("Visszaadott cikkek száma (max 100, alapért. 10)"),
+      },
+      async ({ from, to, document_type, item_code, sap_item_group_id, top_limit }) => {
+        const q = buildQuery({ from, to, document_type, item_code, sap_item_group_id, top_limit });
+        return ok(await sapGet(`/webshop/analytics/products/top-selling${q}`));
       }
     );
 
     server.tool(
       "sap_find_product_stock",
-      "Egy vagy több konkrét cikk árainak és készletszintjeinek lekérdezése cikkszám alapján. Végigiterál a webshop termékeken (item_code szerint rendezve) és visszaadja a talált cikkek teljes adatait (árak HUF/EUR, stocks). Pl.: 'mennyi van raktáron 100001-ből', 'mi az ára a 200005 cikknek'.",
+      "Egy vagy több konkrét cikk árainak és készletszintjeinek lekérdezése cikkszám alapján. Bulk lekérdezés egyetlen API hívással. Visszaad: HUF/EUR árszintek, main_stock, outer_stock, total_stock, available_stock. Pl.: 'mennyi van raktáron 100001-ből', 'mi az ára a 200005 cikknek', 'ezeknek a cikkeknek mennyi a készlete'.",
       {
         item_codes: z.string().describe("Cikkszám(ok) vesszővel, pl. 100001 vagy 100001,100002,100003"),
-        max_pages: z.number().optional().default(150).describe("Max iterált oldalszám (alapért. 150)"),
       },
-      async ({ item_codes, max_pages = 150 }) => {
-        const targets = new Set(item_codes.split(",").map((s) => s.trim()).filter(Boolean));
-        const found: any[] = [];
-
-        for (let page = 1; page <= max_pages && found.length < targets.size; page++) {
-          let result: { data?: any[] } | null = null;
-          try {
-            result = await sapGet<{ data?: any[] }>(`/webshop/products?page=${page}`);
-          } catch {
-            break;
-          }
-
-          const products = result?.data ?? [];
-          if (products.length === 0) break;
-
-          for (const product of products) {
-            if (targets.has(product.item_code)) {
-              found.push(product);
-              if (found.length >= targets.size) break;
-            }
-          }
-        }
-
-        const notFound = Array.from(targets).filter(
-          (code) => !found.some((p) => p.item_code === code)
-        );
-
+      async ({ item_codes }) => {
+        // Use the /webshop/products/bulk endpoint — single API call, no page iteration needed
+        const codes = item_codes.split(",").map((s) => s.trim()).filter(Boolean);
+        const queryString = codes.map((c) => `item_codes[]=${encodeURIComponent(c)}`).join("&");
+        const result = await sapGet<any[]>(`/webshop/products/bulk?${queryString}`);
+        const products = Array.isArray(result) ? result : [];
+        const foundCodes = new Set(products.map((p: any) => p.item_code));
+        const notFound = codes.filter((c) => !foundCodes.has(c));
         return ok({
-          searched: Array.from(targets),
-          found_count: found.length,
+          searched: codes,
+          found_count: products.length,
           not_found: notFound,
-          products: found,
+          products,
         });
       }
     );
